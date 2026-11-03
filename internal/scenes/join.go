@@ -5,6 +5,8 @@ import (
 	"image/color"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
@@ -20,21 +22,27 @@ type JoinMenu struct {
 	servers  []net.ServerInfo
 	selected int
 
+	mu       sync.Mutex
+	scanned  []net.ServerInfo
+	scanning bool
+
 	name       string
-	editing    bool // true = user typing in name field
+	editing    bool
 	directAddr string
-	directMode bool // true = user typing direct address
+	directMode bool
 	errMsg     string
 }
 
+// В NewJoinMenu запускаем скан в фоне
 func NewJoinMenu(m *Manager) *JoinMenu {
-	l, err := net.NewListener()
-	s := &JoinMenu{m: m, name: "Player", directAddr: "127.0.0.1:25000"}
-	if err != nil {
-		s.errMsg = "Discovery error: " + err.Error()
-	} else {
-		s.listener = l
+	l, _ := net.NewListener()
+	s := &JoinMenu{
+		m:        m,
+		listener: l,
+		name:     "Player",
 	}
+	// Запускаем фоновое сканирование подсети (на случай если Broadcast заблокирован)
+	go s.refresh()
 	return s
 }
 
@@ -44,9 +52,64 @@ func (s *JoinMenu) Close() {
 	}
 }
 
+// refresh запускает сканирование подсети в фоне.
+func (s *JoinMenu) refresh() {
+	s.mu.Lock()
+	s.scanning = true
+	s.mu.Unlock()
+
+	var scanned []net.ServerInfo
+	for _, ip := range net.ScanSubnet(net.DefaultTCPPort) {
+		scanned = append(scanned, net.ServerInfo{
+			GameName:       "Direct Host",
+			Address:        ip,
+			Port:           net.DefaultTCPPort,
+			CurrentPlayers: 1,
+			MaxPlayers:     4,
+			LastSeen:       time.Now(),
+		})
+	}
+
+	s.mu.Lock()
+	s.scanned = scanned
+	s.scanning = false
+	s.mu.Unlock()
+}
+
 func (s *JoinMenu) Update() error {
+	// Объединяем multicast + результаты скана
+	var all []net.ServerInfo
+	seen := make(map[string]bool)
+
+	// 1. Результаты от Broadcast (живой эфир)
 	if s.listener != nil {
-		s.servers = s.listener.Servers()
+		for _, srv := range s.listener.Servers() {
+			key := fmt.Sprintf("%s:%d", srv.Address, srv.Port)
+			if !seen[key] {
+				all = append(all, srv)
+				seen[key] = true
+			}
+		}
+	}
+
+	// 2. Результаты от Сканирования подсети
+	s.mu.Lock()
+	for _, srv := range s.scanned {
+		key := fmt.Sprintf("%s:%d", srv.Address, srv.Port)
+		if !seen[key] {
+			all = append(all, srv)
+			seen[key] = true
+		}
+	}
+	scanning := s.scanning
+	s.mu.Unlock()
+
+	s.servers = all
+	if s.selected >= len(s.servers) {
+		s.selected = len(s.servers) - 1
+		if s.selected < 0 {
+			s.selected = 0
+		}
 	}
 
 	if s.editing {
@@ -90,6 +153,11 @@ func (s *JoinMenu) Update() error {
 		s.directMode = true
 		s.directAddr = ""
 	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyR) {
+		if !scanning {
+			go s.refresh()
+		}
+	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 		s.doJoin()
 	}
@@ -97,15 +165,21 @@ func (s *JoinMenu) Update() error {
 		s.m.Set(NewMainMenu(s.m))
 	}
 
+	// Кнопки мышью
 	mx, my := ebiten.CursorPosition()
 	btnY := 490.0
 	for i := 0; i < 3; i++ {
 		bx := 150.0 + float64(i)*180
-		if float64(mx) >= bx && float64(mx) <= bx+150 && float64(my) >= btnY && float64(my) <= btnY+45 {
+		if float64(mx) >= bx && float64(mx) <= bx+150 &&
+			float64(my) >= btnY && float64(my) <= btnY+45 {
 			if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
 				switch i {
 				case 0:
 					s.doJoin()
+				case 1:
+					if !scanning {
+						go s.refresh()
+					}
 				case 2:
 					s.m.Set(NewMainMenu(s.m))
 				}
@@ -123,7 +197,7 @@ func (s *JoinMenu) doJoin() {
 	srv := s.servers[s.selected]
 	client := net.NewClient()
 	if err := client.Connect(srv.Address, srv.Port, s.name); err != nil {
-		s.errMsg = "Connect error: " + err.Error()
+		s.errMsg = "Connect: " + err.Error()
 		return
 	}
 	if s.listener != nil {
@@ -145,7 +219,7 @@ func (s *JoinMenu) connectDirect() {
 	}
 	client := net.NewClient()
 	if err := client.Connect(parts[0], port, s.name); err != nil {
-		s.errMsg = "Connect error: " + err.Error()
+		s.errMsg = "Connect: " + err.Error()
 		return
 	}
 	if s.listener != nil {
@@ -171,9 +245,17 @@ func (s *JoinMenu) Draw(screen *ebiten.Image) {
 	ebitenutil.DebugPrintAt(screen, "[D] Direct: "+s.directAddr+directHint, 50, 80)
 
 	vector.DrawFilledRect(screen, 50, 110, 700, 350, color.RGBA{25, 30, 42, 255}, false)
-	if len(s.servers) == 0 {
-		ebitenutil.DebugPrintAt(screen, "Searching (multicast)...", 300, 270)
+
+	s.mu.Lock()
+	scanning := s.scanning
+	s.mu.Unlock()
+
+	if scanning && len(s.servers) == 0 {
+		ebitenutil.DebugPrintAt(screen, "Scanning subnet...", 300, 270)
+	} else if !scanning && len(s.servers) == 0 {
+		ebitenutil.DebugPrintAt(screen, "No servers found. Press [R] to rescan.", 240, 270)
 	}
+
 	for i, srv := range s.servers {
 		y := 120 + i*50
 		c := color.RGBA{40, 60, 90, 255}
@@ -182,7 +264,8 @@ func (s *JoinMenu) Draw(screen *ebiten.Image) {
 		}
 		vector.DrawFilledRect(screen, 60, float32(y), 680, 44, c, false)
 		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s | %s:%d | %d/%d",
-			srv.GameName, srv.Address, srv.Port, srv.CurrentPlayers, srv.MaxPlayers), 70, y+14)
+			srv.GameName, srv.Address, srv.Port,
+			srv.CurrentPlayers, srv.MaxPlayers), 70, y+14)
 	}
 
 	for i, b := range []string{"Join", "Refresh", "Back"} {
